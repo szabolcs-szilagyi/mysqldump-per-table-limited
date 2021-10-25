@@ -34,6 +34,11 @@ so you can have some data for local development.
 No, you won't get a sane and consistent dump, as we're limiting those pesky
 large tables, so that you can get anything at all.
 
+* Why not use mydumper?
+
+While [[https://github.com/maxbube/mydumper][mydumber]] could be a good program (didn't use it myself), it will get you
+all the data from the database. So you can get 100s of GBs, if that is okay for
+you, then go for it. Personally I just need some data to work with, not all.
 
 * Usage
 
