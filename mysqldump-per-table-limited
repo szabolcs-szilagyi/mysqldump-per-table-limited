@@ -1,0 +1,459 @@
+#!/usr/bin/env bash
+
+redBold="\e[1;91m"
+yellowBold="\e[1;33m"
+bold="\e[1m"
+uline="\e[4m"
+reset="\e[0m"
+
+host="127.0.0.1"
+port="3306"
+user=""
+password=""
+ignore_tables="information_schema\..*\|performance_schema\..*\|mysql\..*"
+databases_to_dump=()
+time_limit="-1 year"
+record_limit=500000
+primary_key_rx='\bpk\b'
+creation_field_rx='\(\btimestamp\b\|\bcreation_time\b\)'
+table_size_filter=$((200 * 1024 * 1024)) # 200 MB
+
+trailing_databases="0"
+dump_folder=""
+
+error() {
+	message=$1
+	shift
+	exit_code=${2:-1}
+
+	echo -e "${redBold}ERROR:${reset} $message" >&2
+	exit "$exit_code"
+}
+
+funny_message() {
+	message=$1
+	shift
+
+	if ! command -v cowsay >/dev/null 2>&1; then
+		echo "$message" >&2
+	else
+		cowsay "$message" >&2
+		echo "" >&2
+	fi
+}
+
+center_print() {
+	message=$1
+	shift
+
+	printf "%*b\n" $(((${#message} + $(tput cols)) / 2)) "$message" >&2
+}
+
+thank_you_message() {
+	funny_message "Thank you for using the tool to restore, use a command below"
+
+	cat <<EOF
+mysql -u username --password=asdf123 < $dump_folder/*
+
+or a for loop:
+
+for file in $dump_folder/*; do
+    echo "processing: \$file" >&2
+    pv "\$file" | mysql -u username --password=asdf123
+done
+
+EOF
+}
+
+show_help() {
+	echo -e "
+${uline}$(basename "$0")${reset}
+As the name suggest will do a per table dump of the target database(s). Will also
+use limits on large tables, so that it won't download all the data, but part of
+it. This ${bold}${uline}will not produce a consistent dump!${reset} It should NOT be used for backup
+purpose! This script is just so that you can download some of the data and start
+developing locally.
+
+${uline}${bold}Note:${reset}
+- the \`mysql\`, \`performance_schema\` and \`information_schema\` databases are
+ignored by default.
+- progress feedback is just there to show that something is happening, it is far
+far away from having any kind of accuracy
+
+${uline}${bold}Usage:${reset} $(basename "$0") <options> [db_name db_name ...]
+    --help               Display help
+    -h, --host           Host name, default is $host
+    -P, --port           TCP/IP port number for the connection, default is $port
+    -u, --user           Username to use for when connecting to the server
+    -p, --password       Password to use for then connecting to the server
+    -B, --databases      With this you signal that you don't wish to get all the
+                         databases, but the list provided on the end.
+    -i, --ignore-table   Table name with database that should be ignored. Can be
+                         used multiple times if you have more than one table that
+                         you wish to ignore. Used with grep, so regexp is
+                         expected. e.g.: -i \"blog\.users\" -i \"web_shop\.creditcards\"
+    -t, --time-limit     Limit how old records are still okay. Should be a format
+                         that is understandable by the \`date\` command. The
+                         default is \"$time_limit\"
+    -c, --creation-field Regexp for the creation field, this will be used to
+                         select the correct field along which we can use the time
+                         limit (-t, --time-limit) option.
+                         Default is \"${creation_field_rx//\\/\\\\}\"
+    -r, --record-limit   Limit the amount of records to get when the collection
+                         is too big. Default it $record_limit
+    -k, --primary-key    Regexp pattern for primary keys in the dbs, this will be
+                         used for when there is a lot of records to sort along it
+                         descending. Default is \"${primary_key_rx//\\/\\\\}\"
+    -s, --size-limit     Can provide in bytes as to what is the size of a table
+                         from which we should apply some sort of filtering,
+                         either along creation field or pirmary key or just
+                         number of records. Default is $table_size_filter bytes.
+
+${uline}${bold}Example:${reset}
+$(basename "$0") -B -h my.database.com -u root -p asdf123 blog web_shop
+"
+}
+
+parse_command_line() {
+	ARGS=$(getopt \
+		-o h:u:p:Bi:P:t:r:k:s: \
+		--long help,host:,user:,password:,databases,ignore-table:,port: \
+		--long time-limit:,record-limit:,primary-key:,size-limit -- "$@")
+	getopt_exit="$?"
+
+	if [ "$getopt_exit" -ne 0 ]; then
+		show_help
+		exit 1
+	fi
+
+	eval set -- "$ARGS"
+
+	for o; do
+		case "$o" in
+		--help)
+			show_help
+			exit
+			;;
+		-h | --host)
+			if [ -n "${2:-}" ]; then
+				host="${2}"
+				shift 2
+			else
+				echo "ERROR: '-h|--host' cannot be empty." >&2
+				show_help
+				exit 1
+			fi
+			;;
+		-u | --user)
+			if [ -n "${2:-}" ]; then
+				user="${2}"
+				shift 2
+			fi
+			;;
+		-p | --password)
+			if [ -n "${2:-}" ]; then
+				password="${2}"
+				shift 2
+			fi
+			;;
+		-B | --databases)
+			trailing_databases=1
+			shift
+			;;
+		-i | --ignore-table)
+			if [ -n "${2:-}" ]; then
+				ignore_tables+="\|${2}"
+				shift 2
+			fi
+			;;
+		-P | --port)
+			if [ -n "${2:-}" ]; then
+				port="${2}"
+				shift 2
+			fi
+			;;
+		-t | --time-limit)
+			if [ -n "${2:-}" ]; then
+				time_limit="${2}"
+				shift 2
+			fi
+			;;
+		-k | --primary-key)
+			if [ -n "${2:-}" ]; then
+				primary_key_rx="${2}"
+				shift 2
+			fi
+			;;
+		-r | --record-limit)
+			if [ -n "${2:-}" ]; then
+				record_limit="${2}"
+				shift 2
+			fi
+			;;
+		-s | --size-limit)
+			if [ -n "${2:-}" ]; then
+				table_size_filter="${2}"
+				shift 2
+			fi
+			;;
+		--)
+			shift
+			break
+			;;
+		esac
+	done
+
+	if [ "$trailing_databases" -eq 1 ] && [ ! ${#*} -eq 0 ]; then
+		databases_to_dump=("${*}")
+	fi
+
+	if
+		[ "$trailing_databases" -eq 1 ] &&
+			[ ${#databases_to_dump[@]} -eq 0 ]
+	then
+		error "Expected last params to be a list of databases (-B, --databases)"
+	fi
+
+	for mandatory_field in "user" "password"; do
+		if [ -z "${!mandatory_field}" ]; then
+			show_help
+			error "missing parameter - $mandatory_field"
+		fi
+	done
+}
+
+check_prepreqs() {
+	needed_apps=("pv" "mysqldump" "mysql")
+	for app in ${needed_apps[*]}; do
+		if ! command -v "$app" >/dev/null 2>&1; then
+			error "Missing \"$app\"! Need following commands: ${needed_apps[*]}"
+		fi
+	done
+}
+
+run_sql() {
+	query=$1
+
+	mysql \
+		--silent \
+		--skip-column-names \
+		--host="$host" \
+		--port="$port" \
+		--user="$user" \
+		--password="$password" \
+		--execute "$query"
+}
+
+get_database_size() {
+	run_sql "
+            SELECT SUM(data_length + index_length) 'Size in MiB'
+            FROM information_schema.tables
+            WHERE engine <> 'MEMORY'
+            GROUP BY table_catalog;"
+}
+
+get_databases() {
+	for database in $(run_sql "SHOW DATABASES;"); do
+		databases_to_dump+=("$database")
+	done
+}
+
+get_columns() {
+	database=$1
+	shift
+	table=$1
+	shift
+
+	run_sql "
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE
+                table_schema = '$database'
+                AND table_name = '$table';"
+}
+
+get_table_size() {
+	database=$1
+	shift
+	table=$1
+	shift
+
+	size=$(run_sql "
+            SELECT SUM(data_length + index_length) 'Size in MiB'
+            FROM information_schema.tables
+            WHERE
+                engine <> 'MEMORY'
+                AND table_name='$table'
+                AND table_schema='$database'
+            GROUP BY table_catalog;")
+
+	if [ -z "$size" ]; then
+		echo "0"
+	else
+		echo "$size"
+	fi
+}
+
+confirm_with_user() {
+	confirmation_question=$1
+
+	printf "%s (yN) " "$confirmation_question" >&2
+	read -r REPLY
+	if ! echo "$REPLY" | grep '^[Yy]' -q; then
+		echo "Stopping then... BYE"
+		exit 1
+	fi
+
+}
+
+do_dump() {
+	table=$1
+	shift
+	database=$1
+	shift
+	where=${1:-1}
+	shift
+
+	mysqldump \
+		--where "$where" \
+		--opt \
+		--add-drop-table \
+		--skip-lock-tables \
+		--no-tablespaces \
+		--compress \
+		--host="$host" \
+		--port="$port" \
+		--user="$user" \
+		--password="$password" \
+		"$database" "$table"
+}
+
+get_date_filter() {
+	filter_column=$1
+	shift
+
+	date=$(date +%F --date="$time_limit")
+
+	echo "$filter_column > $date"
+}
+
+dump_table() {
+	table=$1
+	shift
+	database=$1
+	shift
+	dump_folder=$1
+	shift
+
+	table_dump_file="$dump_folder/$database.$table.sql"
+
+	if
+		echo "$database.$table" | grep "$ignore_tables" -q ||
+			[ -e "$table_dump_file" ]
+	then
+		printf '| %-60.60s| skipping\n' "$database.$table"
+		return
+	fi
+
+	pv_format="$(printf '| %-60.60s|' "$database.$table") - %N %b %T %t %r %a %e"
+
+	table_size=$(get_table_size "$database" "$table")
+	columns=$(get_columns "$database" "$table")
+
+	time_filter_field=$(
+		echo "$columns" |
+			grep "$creation_field_rx" -o -m 1 |
+			head -1
+	)
+
+	limit_filter="1"
+	primary_key_field=$(
+		echo "$columns" |
+			grep "$primary_key_rx" -o -m 1 |
+			head -1
+	)
+	if [ -n "$primary_key_field" ]; then
+		limit_filter="1 ORDER BY $primary_key_field DESC LIMIT $record_limit"
+	else
+		limit_filter="1 LIMIT $record_limit"
+	fi
+
+	date_filter="1"
+	filter_message="unfiltered"
+	if
+		[ "$table_size" -gt "$table_size_filter" ] &&
+			[ -n "$time_filter_field" ]
+	then
+		date_filter=$(get_date_filter "$time_filter_field")
+		filter_message="${yellowBold}filtered${reset} by '$time_filter_field' (${yellowBold}$date_filter${reset})"
+	fi
+
+	printf "| %-60.60s| -  %s MB -- %b\n" "$database.$table" \
+		$((table_size / 1024 / 1024)) \
+		"$filter_message" \
+		>&2
+
+	dumped_successfully=1
+	retry_counter=0
+	while [ ! "$dumped_successfully" -eq 0 ] && [ "$retry_counter" -le 5 ]; do
+		printf "CREATE DATABASE IF NOT EXISTS %s;\nUSE %s;\n" \
+			"$database" \
+			"$database" \
+			>"$table_dump_file"
+
+		if [ "$retry_counter" -gt 0 ]; then
+			center_print "*** ${redBold}RETRY${reset} error_code: $dumped_successfully retry_counter: $retry_counter table_size: $table_size ***"
+		fi
+		retry_counter=$((retry_counter + 1))
+
+		if [ "$retry_counter" -eq 6 ]; then
+			center_print "*** ${redBold}final retry  limit ($limit_filter)${reset} ***"
+			do_dump "$table" "$database" "$limit_filter" |
+				pv -F "$pv_format" -s "$table_size" \
+					>>"$table_dump_file"
+			dumped_successfully="${PIPESTATUS[0]}"
+		else
+			do_dump "$table" "$database" "$date_filter" |
+				pv -F "$pv_format" -s "$table_size" \
+					>>"$table_dump_file"
+			dumped_successfully="${PIPESTATUS[0]}"
+		fi
+	done
+}
+
+run_mysqldump() {
+	database_size=$(get_database_size)
+	if [ -z "$database_size" ]; then
+		error "Could not get database size"
+	fi
+
+	echo "Database size is: $((database_size / 1024 / 1024 / 1024)) GB" >&2
+
+	confirm_with_user "We will get some of that data, continue?"
+
+	dump_folder="$host-$(date +%F)"
+	mkdir -p "$dump_folder"
+
+	funny_message "Go have a coffee, this will take a while... ☕"
+
+	if [ -z "${databases_to_dump[*]}" ]; then
+		get_databases || error "Could not get the list of databases"
+	fi
+
+	for database in ${databases_to_dump[*]}; do
+		tables=$(run_sql "use $database; show tables;")
+		for table in $tables; do
+			dump_table "$table" "$database" "$dump_folder"
+		done
+	done
+}
+
+main() {
+	check_prepreqs
+	parse_command_line "$@"
+
+	run_mysqldump || exit 1
+	thank_you_message
+}
+
+main "$@"
