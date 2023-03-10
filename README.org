@@ -2,15 +2,15 @@
 
 * The why
 
-We all need a dump. Sometimes the database is just too big and a single dump
-just won't cut it. Thinking here of those odd DBs that contain 200+ GBs of data
-with the odd 70 GB tables. Those databases won't be backed up using a =mysqldump=
-script with a cron... Just think about it: to download 70 GB of data in an sql
-dump takes a long time, your query will timeout.
+Sometimes databases are just too big and a single dump just won't cut it.
+Thinking here of those odd DBs that contain 200+ GBs of data with the odd 70 GB
+tables. Those databases won't be backed up using a =mysqldump= script with a
+cron... Just think about it: to download 70 GB of data via =mysqldump= takes a
+long time, your query will timeout.
 - But I can increase the execution time - You say
 - Yes, but for how long? Also if you want a sane and consistent dump then you
   also need to lock - at least the table - all your clients will wait for an
-  hour till you dump?
+  hour till the process runs?
 - But then how should I do it?
 - If you have such a nice database then you will have to take snapshots of the
   disk where the data resides OR have replication going on. But those are topics
@@ -23,8 +23,8 @@ dump takes a long time, your query will timeout.
 - create one dump file per table in the database(s)
 - if that table is large and there is a time column available, then it will try
   to limit the retrieved data to only get the latest records
-- when the dump times out multiple times, then it will try to get a dump with a
-  simple limit
+- when the process times out multiple times, then it will try to get a dump with
+  a simple limit
 
 * What will you get?
 
